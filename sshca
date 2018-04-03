@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+
+source config.sh
+
+# ------------------------------------------------
+
+__sshca_setup() {
+    [[ -d keys ]] || mkdir keys
+    [[ -d logs ]] || mkdir logs
+    [[ -d .tmp ]] || mkdir .tmp
+
+    [[ -f serial ]] || echo 0 > serial
+}
+
+__sshca_confirm_action() {
+    read choice
+    
+    case "$choice" in 
+        $1 ) echo 'true';;
+        *  ) echo 'false';;
+    esac
+}
+
+# ------------------------------------------------
+
+command=$1; shift
+remote_host=''
+
+while [ $# -gt 0 ]; do
+    if [[ $# -eq 1 ]]; then
+        remote_host=$1; break
+    fi
+    
+    case "$1" in
+        --khash) key_hash=$2;    shift;;
+        --ktype) key_types=$2;   shift;;
+        --ksize) key_size=$2     shift;;
+        --user)  remote_user=$2; shift;;
+        --name)  cert_name=$2;   shift;;        
+        --cakey) ca_key_path=$2; shift;;
+        --smartcard) ca_smartcard='true';;
+    esac
+
+    shift
+done
+
+ca_keygen=$bin_path
+
+if [[ $ca_smartcard == 'true' ]]; then
+    ca_key_path="${ca_key_path}.pub"
+    ca_keygen="$ca_keygen -D $ca_smartcard_lib "
+fi
+
+# ------------------------------------------------
+
+if [[ $command == 'init' ]]; then
+    printf "[+] Generating CA key with type/size: %s/%s\n" $ca_key_type $ca_key_size
+    ssh-keygen -qf keys/ssh_ca_key -t $ca_key_type -b $ca_key_size
+    
+    echo -e "\n[i] Finished operation."
+fi
+
+# ------------------------------------------------
+
+if [[ $command == 'signhost' ]]; then
+    __sshca_setup
+    
+    tempfile=$(mktemp -p .tmp)
+    
+    for ktype in ${key_types//,/ }; do
+        echo -n "[+] Retrieving ${ktype^^} key from $remote_host... "
+        scp -q $remote_user@$remote_host:/etc/ssh/ssh_host_${ktype}_key.pub $tempfile
+        
+        if [[ $? -eq 0 ]]; then
+            echo 'ok.'
+            
+            serial=$(<serial)
+            ((serial++))
+            
+            keyfp=$(ssh-keygen -qlf $tempfile -E $key_hash | cut -d' ' -f2)
+            echo "   [i] Fingerprint: $keyfp"
+            
+            names=${cert_name:-$remote_host}
+            echo "   [i] Principals:  $names"
+            
+            echo "   [i] Serial: $serial"
+            
+            echo -en "\n   [?] Type 'sign' if everything is correct: "
+            confirm=$(__sshca_confirm_action "sign")
+            
+            if [[ $confirm == 'true' ]]; then
+                echo "   [+] Signing certificate..."
+                [[ $ca_smartcard == 'true' ]] && echo -n "       "
+                
+                $ca_keygen -q -s $ca_key_path -z $serial -I $remote_host -h -n $names -V +$cert_validity $tempfile
+                
+                if [[ $? -eq 0 ]]; then
+                    echo $serial > serial
+                    
+                    printf "%s %s host %s %s %s %s\n" "$(date '+%Y-%m-%d %H:%M')" $serial $names ${ktype^^} $keyfp $cert_validity >> logs/issued.log
+                    
+                    echo -e "   [+] Installing certificate on the remote server...\n"
+                    scp -q ${tempfile}-cert.pub $remote_user@$remote_host:/etc/ssh/ssh_host_${ktype}_key-cert.pub
+                    rm $tempfile ${tempfile}-cert.pub
+                else
+                    echo '   [!] Could not sign certificate. Something went wrong.'
+                fi
+            else
+                echo -e "   [-] Canceled by the user. Skipping this key...\n"
+            fi
+        else
+            echo 'failed!'
+        fi
+    done
+fi
+
+# ------------------------------------------------
+
+if [[ $command == 'revoke' ]]; then
+    [[ -d krl ]] || mkdir krl
+    [[ -f krl/version ]] || echo 0 > krl/version
+    
+    version=$(<krl/version)
+    ((version++))
+    
+    if [[ -f krl/ssh_revoked_keys ]]; then
+        ssh-keygen -k -f krl/ssh_revoked_keys -u -s ${ca_key_path}.pub -z $version krl/keylist.txt
+    else
+        ssh-keygen -k -f krl/ssh_revoked_keys -s ${ca_key_path}.pub -z $version krl/keylist.txt
+    fi
+    
+    [[ $? -eq 0 ]] && echo $version >krl/version
+fi
+
+# ------------------------------------------------
+
+if [[ $command == 'pushkrl' ]]; then
+    echo -n '[+] Sending key revocation list... '
+    scp -q krl/ssh_revoked_keys $remote_user@$remote_host:/etc/ssh/ssh_revoked_keys
+    [[ $? -eq 0 ]] && echo 'ok!'
+    
+    if [[ -f krl/ssh_revoked_keys.minisig ]]; then
+        echo -n '[+] Sending krl signature... '
+        scp -q krl/ssh_revoked_keys.minisig $remote_user@$remote_host:/etc/ssh/ssh_revoked_keys.minisig
+        [[ $? -eq 0 ]] && echo 'ok!'
+    fi
+fi
+
+# ------------------------------------------------
+
+if [[ $command == 'hostfp' ]]; then
+    errors=0
+
+    echo -n "[+] Connecting to $remote_host... "
+
+    ssh -q $remote_user@$remote_host key_types=$key_types key_hash=$key_hash 'bash -s' <<-'EOS'
+        echo 'ok!'
+
+        for ktype in ${key_types//,/ }; do
+            if [[ -f /etc/ssh/ssh_host_${ktype}_key.pub ]]; then
+                echo -n "   [i] ${ktype^^} fingerprint: "
+                ssh-keygen -lf /etc/ssh/ssh_host_${ktype}_key.pub -E $key_hash | cut -d' ' -f2
+            else (( errors++ )); fi
+        done
+        
+        printf "\n[i] Finished operation with %d errors.\n" $errors
+	EOS
+
+    if [[ $? -ne 0 ]]; then
+        echo 'failed!'; exit 1
+    fi
+fi
+
+# ------------------------------------------------
+
+if [[ $command == 'regenkeys' ]]; then
+    # This command is a very, very bad idea.
+    # Note: if you regenerate the trusted key,
+    # the next connection attempt is going to fail.
+
+    echo -n "[+] Connecting to $remote_host... "
+
+    ssh -q $remote_user@$remote_host key_types=$key_types 'bash -s' <<-'EOS'
+        echo 'ok!'
+
+        for ktype in ${key_types//,/ }; do
+            echo "[+] Regenerating $ktype public key..."
+
+            if [[ -f /etc/ssh/ssh_host_${ktype}_key ]]; then
+                echo -en "   [i] Old fingerprint: "
+                ssh-keygen -qlf /etc/ssh/ssh_host_${ktype}_key.pub | cut -d' ' -f2
+                rm /etc/ssh/ssh_host_${ktype}_key*
+            fi
+
+            ssh-keygen -qf /etc/ssh/ssh_host_${ktype}_key -t ${ktype} -N ''
+
+            echo -en "   [i] New fingerprint: "
+            ssh-keygen -qlf /etc/ssh/ssh_host_${ktype}_key.pub | cut -d' ' -f2
+        done
+        
+        echo -e "\n[i] Finished operation."
+	EOS
+
+    if [[ $? -ne 0 ]]; then
+        echo 'failed!'; exit 1
+    fi
+fi
